@@ -549,6 +549,89 @@ function Get-BLERSSI {
     }
 }
 
+# ─── Registry Write Helpers ───
+
+function Set-RegistryValueWithPrivilege {
+    <#
+    .SYNOPSIS
+    Writes a registry value using .NET RegistryKey API with privilege escalation.
+    Set-ItemProperty fails on protected BT keys even as admin — this takes
+    ownership and grants access before writing.
+    #>
+    param(
+        [string]$HivePath,      # e.g. "SYSTEM\CurrentControlSet\Services\BTHPORT\..."
+        [string]$ValueName,
+        $ValueData,
+        [Microsoft.Win32.RegistryValueKind]$Kind
+    )
+
+    $wrote = $false
+
+    # Enable backup/restore privileges for the current process
+    try {
+        $privRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            'FullControl',
+            'Allow'
+        )
+
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($HivePath, 'ReadWriteSubTree', 'FullControl')
+        if ($key) {
+            $key.SetValue($ValueName, $ValueData, $Kind)
+            $key.Close()
+            $wrote = $true
+        }
+    } catch {
+        # If direct write fails, try taking ownership first
+        try {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                $HivePath,
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                [System.Security.AccessControl.RegistryRights]::TakeOwnership
+            )
+            if ($key) {
+                $acl = $key.GetAccessControl()
+                $admin = New-Object System.Security.Principal.NTAccount('BUILTIN', 'Administrators')
+                $acl.SetOwner($admin)
+                $key.SetAccessControl($acl)
+                $key.Close()
+
+                # Re-open with write access after taking ownership
+                $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                    $HivePath,
+                    [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                    [System.Security.AccessControl.RegistryRights]::SetValue -bor
+                    [System.Security.AccessControl.RegistryRights]::ReadKey
+                )
+                if ($key) {
+                    $acl = $key.GetAccessControl()
+                    $acl.AddAccessRule($privRule)
+                    $key.SetAccessControl($acl)
+                    $key.SetValue($ValueName, $ValueData, $Kind)
+                    $key.Close()
+                    $wrote = $true
+                }
+            }
+        } catch {
+            # Last resort: use reg.exe
+            try {
+                $regExe = Join-Path $env:SystemRoot 'System32\reg.exe'
+                if ($Kind -eq [Microsoft.Win32.RegistryValueKind]::Binary) {
+                    $hexStr = ($ValueData | ForEach-Object { '{0:x2}' -f $_ }) -join ''
+                    $null = & $regExe add "HKLM\$HivePath" /v $ValueName /t REG_BINARY /d $hexStr /f 2>&1
+                } else {
+                    $null = & $regExe add "HKLM\$HivePath" /v $ValueName /t REG_SZ /d "$ValueData" /f 2>&1
+                }
+                if ($LASTEXITCODE -eq 0) { $wrote = $true }
+            } catch {
+                Write-Verbose "reg.exe fallback failed: $_"
+            }
+        }
+    }
+
+    return $wrote
+}
+
 # ─── Rename Functions ───
 
 function Rename-BluetoothDevice {
@@ -556,39 +639,45 @@ function Rename-BluetoothDevice {
 
     $mac = $Device.Mac.ToLower()
     $macUpper = $Device.Mac.ToUpper()
+    $results = @()
 
     # 1. BTHPORT — write as REG_BINARY (UTF-8 + null)
-    $bthportPath = "HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\$mac"
-    if (Test-Path $bthportPath) {
-        $nameBytes = [System.Text.Encoding]::UTF8.GetBytes($NewName + [char]0)
-        Set-ItemProperty -Path $bthportPath -Name 'FriendlyName' -Value $nameBytes -Type Binary
-    }
+    $bthportKey = "SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\$mac"
+    $nameBytes = [System.Text.Encoding]::UTF8.GetBytes($NewName + [char]0)
+    $ok = Set-RegistryValueWithPrivilege -HivePath $bthportKey -ValueName 'FriendlyName' -ValueData $nameBytes -Kind ([Microsoft.Win32.RegistryValueKind]::Binary)
+    $results += "BTHPORT: $(if ($ok) { 'OK' } else { 'FAILED' })"
 
-    # 2. BTHENUM — write as REG_SZ
+    # 2. BTHENUM — write as REG_SZ (classic BT PnP entries)
     $btheNumBase = "HKLM:\SYSTEM\CurrentControlSet\Enum\BTHENUM"
     if (Test-Path $btheNumBase) {
         Get-ChildItem $btheNumBase -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.PSChildName -match $macUpper -or $_.Name -match "DEV_$macUpper" } |
+            Where-Object { $_.PSChildName -match $macUpper } |
             ForEach-Object {
                 $fnProp = Get-ItemProperty -Path $_.PSPath -Name 'FriendlyName' -ErrorAction SilentlyContinue
                 if ($fnProp) {
-                    Set-ItemProperty -Path $_.PSPath -Name 'FriendlyName' -Value $NewName -Type String
+                    $subKey = $_.Name -replace '^HKEY_LOCAL_MACHINE\\', ''
+                    $ok = Set-RegistryValueWithPrivilege -HivePath $subKey -ValueName 'FriendlyName' -ValueData $NewName -Kind ([Microsoft.Win32.RegistryValueKind]::String)
+                    $results += "BTHENUM ($($_.PSChildName)): $(if ($ok) { 'OK' } else { 'FAILED' })"
                 }
             }
     }
 
-    # 3. BTHLE — write as REG_SZ
+    # 3. BTHLE — write as REG_SZ (BLE PnP entries)
     $bthLEBase = "HKLM:\SYSTEM\CurrentControlSet\Enum\BTHLE"
     if (Test-Path $bthLEBase) {
         Get-ChildItem $bthLEBase -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.PSChildName -match $macUpper -or $_.PSChildName -match $mac -or $_.Name -match "DEV_" } |
+            Where-Object { $_.PSChildName -match $mac } |
             ForEach-Object {
                 $fnProp = Get-ItemProperty -Path $_.PSPath -Name 'FriendlyName' -ErrorAction SilentlyContinue
-                if ($fnProp) {
-                    Set-ItemProperty -Path $_.PSPath -Name 'FriendlyName' -Value $NewName -Type String
+                if ($fnProp -and $fnProp.FriendlyName -ne $null) {
+                    $subKey = $_.Name -replace '^HKEY_LOCAL_MACHINE\\', ''
+                    $ok = Set-RegistryValueWithPrivilege -HivePath $subKey -ValueName 'FriendlyName' -ValueData $NewName -Kind ([Microsoft.Win32.RegistryValueKind]::String)
+                    $results += "BTHLE ($($_.PSChildName)): $(if ($ok) { 'OK' } else { 'FAILED' })"
                 }
             }
     }
+
+    return $results
 }
 
 function Restore-BluetoothDeviceName {
@@ -600,20 +689,16 @@ function Restore-BluetoothDeviceName {
     }
 
     $mac = $Device.Mac.ToLower()
-    $bthportPath = "HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\$mac"
+    $bthportKey = "SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\$mac"
 
-    # Clear BTHPORT FriendlyName (set to single null byte = use device-reported name)
-    if (Test-Path $bthportPath) {
-        Set-ItemProperty -Path $bthportPath -Name 'FriendlyName' -Value ([byte[]](0)) -Type Binary
-    }
+    # Clear BTHPORT FriendlyName (single null byte = use device-reported name)
+    Set-RegistryValueWithPrivilege -HivePath $bthportKey -ValueName 'FriendlyName' -ValueData ([byte[]](0)) -Kind ([Microsoft.Win32.RegistryValueKind]::Binary) | Out-Null
 
     # Restore BTHENUM / BTHLE to original name
-    Rename-BluetoothDevice -Device $Device -NewName $originalName
+    Rename-BluetoothDevice -Device $Device -NewName $originalName | Out-Null
 
     # Re-clear BTHPORT so Windows uses the device name
-    if (Test-Path $bthportPath) {
-        Set-ItemProperty -Path $bthportPath -Name 'FriendlyName' -Value ([byte[]](0)) -Type Binary
-    }
+    Set-RegistryValueWithPrivilege -HivePath $bthportKey -ValueName 'FriendlyName' -ValueData ([byte[]](0)) -Kind ([Microsoft.Win32.RegistryValueKind]::Binary) | Out-Null
 
     return $true
 }
@@ -772,12 +857,23 @@ function Show-DeviceDetails {
                     $confirm = Read-Host
                     if ($confirm -ne 'n' -and $confirm -ne 'N') {
                         try {
-                            Rename-BluetoothDevice -Device $Device -NewName $newName
-                            $Device.DisplayName = $newName
-                            $Device.CustomName = $newName
-                            $Device.IsRenamed = $true
+                            $renameResults = Rename-BluetoothDevice -Device $Device -NewName $newName
                             Write-Host ''
-                            Write-Host '  Renamed successfully!' -ForegroundColor Green
+                            foreach ($r in $renameResults) {
+                                $color = if ($r -match 'OK') { 'Green' } else { 'Red' }
+                                Write-Host "    $r" -ForegroundColor $color
+                            }
+                            $anyOk = ($renameResults | Where-Object { $_ -match 'OK' }).Count -gt 0
+                            if ($anyOk) {
+                                $Device.DisplayName = $newName
+                                $Device.CustomName = $newName
+                                $Device.IsRenamed = $true
+                                Write-Host ''
+                                Write-Host '  Renamed successfully!' -ForegroundColor Green
+                            } else {
+                                Write-Host ''
+                                Write-Host '  All writes failed. Try running as Administrator.' -ForegroundColor Red
+                            }
                             Write-Host '  You may need to reconnect the device or restart Bluetooth.' -ForegroundColor DarkGray
                             Write-Host ''
                             Write-Host '  Restart Bluetooth service now? [y/N]: ' -ForegroundColor Yellow -NoNewline
