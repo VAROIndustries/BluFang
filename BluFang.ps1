@@ -11,8 +11,6 @@
     Works with Windows PowerShell 5.1 and PowerShell 7+.
 #>
 
-# ─── Strict mode ───
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ─── Lookup Tables ───
@@ -67,7 +65,8 @@ function Write-Banner {
 "@
     Write-Host $banner -ForegroundColor Cyan
     Write-Host '  Bluetooth Device Renamer & Inspector' -ForegroundColor DarkCyan
-    Write-Host '  Named for Harald Bluetooth — king, unifier, namer of things' -ForegroundColor DarkGray
+    Write-Host "  A VAR$([char]0x00D8) Industries tool" -ForegroundColor DarkGray
+    Write-Host "  Named for Harald Bluetooth $([char]0x2014) king, unifier, namer of things" -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -265,13 +264,18 @@ function Merge-DeviceLists {
     }
 
     foreach ($bt in $BTHPORTDevices) {
-        $pnpEntries = if ($pnpByMac.ContainsKey($bt.Mac)) { $pnpByMac[$bt.Mac] } else { @() }
+        $pnpEntries = @()
+        if ($pnpByMac.ContainsKey($bt.Mac)) {
+            $pnpEntries = @($pnpByMac[$bt.Mac])
+        }
 
         # Pick best PnP entry for display data (prefer one with battery or category)
-        $bestPnp = $pnpEntries | Sort-Object { if ($_.BatteryLevel -ne $null) { 0 } else { 1 } } | Select-Object -First 1
-
-        # Collect all PnP instance IDs (needed for renaming all registry entries)
-        $allInstanceIds = $pnpEntries | ForEach-Object { $_.InstanceId }
+        $bestPnp = $null
+        $allInstanceIds = @()
+        if ($pnpEntries.Count -gt 0) {
+            $bestPnp = $pnpEntries | Sort-Object { if ($_.BatteryLevel -ne $null) { 0 } else { 1 } } | Select-Object -First 1
+            $allInstanceIds = @($pnpEntries | ForEach-Object { $_.InstanceId })
+        }
 
         $category = ''
         if ($bestPnp -and $bestPnp.Category) { $category = $bestPnp.Category }
@@ -894,9 +898,9 @@ function Start-BluFang {
         }
 
         # Discovery
-        $bthport = Get-BTHPORTDevices
-        $pnp     = Get-PnPBluetoothDevices
-        $devices = Merge-DeviceLists -BTHPORTDevices $bthport -PnPDevices $pnp
+        $bthport = @(Get-BTHPORTDevices)
+        $pnp     = @(Get-PnPBluetoothDevices)
+        $devices = @(Merge-DeviceLists -BTHPORTDevices $bthport -PnPDevices $pnp)
 
         if ($devices.Count -eq 0) {
             Write-Host ''
