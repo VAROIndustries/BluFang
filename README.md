@@ -1,3 +1,3 @@
 # BluFang
 
-_Built by [VARØ Industries](https://varo.industries/apps)_
+_Built by [VARØ Industries](https://varo.industries/apps#github)_
