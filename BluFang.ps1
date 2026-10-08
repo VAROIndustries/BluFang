@@ -373,107 +373,90 @@ function Get-DeviceType {
     return 'Bluetooth Device'
 }
 
-# ─── Connection Status (WinRT via STA Runspace) ───
+# ─── Connection Status (native Windows API) ───
+
+function Initialize-BluetoothStatusApi {
+    if ('BluFang.NativeBluetooth' -as [type]) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace BluFang {
+    public static class NativeBluetooth {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SystemTime {
+            public ushort Year, Month, DayOfWeek, Day, Hour, Minute, Second, Milliseconds;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DeviceInfo {
+            public uint Size;
+            public ulong Address;
+            public uint ClassOfDevice;
+            [MarshalAs(UnmanagedType.Bool)] public bool Connected;
+            [MarshalAs(UnmanagedType.Bool)] public bool Remembered;
+            [MarshalAs(UnmanagedType.Bool)] public bool Authenticated;
+            public SystemTime LastSeen, LastUsed;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 248)] public string Name;
+        }
+        [DllImport("bthprops.cpl", ExactSpelling = true)]
+        private static extern uint BluetoothGetDeviceInfo(IntPtr radio, ref DeviceInfo info);
+        public static string GetConnectionStatus(ulong address) {
+            var info = new DeviceInfo();
+            info.Size = (uint)Marshal.SizeOf(typeof(DeviceInfo));
+            info.Address = address;
+            uint error = BluetoothGetDeviceInfo(IntPtr.Zero, ref info);
+            if (error != 0) return "Unknown";
+            return info.Connected ? "Connected" : "Disconnected";
+        }
+    }
+}
+"@ -ErrorAction Stop
+}
+
+function Get-NativeBluetoothConnectionStatus {
+    param([string]$Mac)
+    return [BluFang.NativeBluetooth]::GetConnectionStatus([Convert]::ToUInt64($Mac, 16))
+}
+
+function Get-PnPBluetoothConnectionStatus {
+    param([string[]]$InstanceIds)
+    $states = @()
+    foreach ($id in $InstanceIds) {
+        # PnP Status=OK describes driver health, not a Bluetooth connection.
+        $prop = Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_DeviceContainer_IsConnected' -ErrorAction SilentlyContinue
+        if ($prop -and $prop.Type -eq 'Boolean' -and $prop.Data -is [bool]) {
+            $states += $prop.Data
+        }
+    }
+    if ($states -contains $true) { return 'Connected' }
+    if ($states.Count -gt 0) { return 'Disconnected' }
+    return 'Unknown'
+}
 
 function Update-ConnectionStatus {
     param([PSCustomObject[]]$Devices)
 
-    # Build list of MAC addresses as UInt64
-    $macList = @()
-    foreach ($d in $Devices) {
-        $macList += @{ Mac = $d.Mac; HasBLE = $d.HasBLE }
-    }
-
-    $scriptBlock = {
-        param($macList)
-        $results = @{}
-
-        # Load WinRT types
-        try {
-            [void][Windows.Devices.Bluetooth.BluetoothDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
-            [void][Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
-        } catch {
-            # WinRT types may already be loaded or unavailable
-        }
-
-        # Helper to await WinRT async
-        Add-Type -TypeDefinition @"
-using System;
-using System.Threading;
-using Windows.Foundation;
-public static class WinRTAwait {
-    public static T Await<T>(IAsyncOperation<T> op) {
-        var evt = new ManualResetEvent(false);
-        op.Completed = delegate { evt.Set(); };
-        if (op.Status == AsyncStatus.Started) { evt.WaitOne(3000); }
-        if (op.Status == AsyncStatus.Completed) { return op.GetResults(); }
-        return default(T);
-    }
-}
-"@ -ReferencedAssemblies @(
-            'System.Runtime.WindowsRuntime',
-            [Windows.Devices.Bluetooth.BluetoothDevice].Assembly.Location
-        ) -ErrorAction SilentlyContinue
-
-        foreach ($entry in $macList) {
-            $mac = $entry.Mac
-            $macUInt64 = [Convert]::ToUInt64($mac, 16)
-            $status = 'Unknown'
-
-            try {
-                if ($entry.HasBLE) {
-                    $op = [Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($macUInt64)
-                    $dev = [WinRTAwait]::Await($op)
-                } else {
-                    $op = [Windows.Devices.Bluetooth.BluetoothDevice]::FromBluetoothAddressAsync($macUInt64)
-                    $dev = [WinRTAwait]::Await($op)
-                }
-                if ($dev) {
-                    $status = $dev.ConnectionStatus.ToString()
-                    $dev.Dispose()
-                }
-            } catch {
-                $status = 'Unknown'
-            }
-            $results[$mac] = $status
-        }
-        return $results
-    }
-
-    # Run in STA runspace for WinRT compatibility
+    $nativeAvailable = $false
     try {
-        $runspace = [RunspaceFactory]::CreateRunspace()
-        $runspace.ApartmentState = 'STA'
-        $runspace.ThreadOptions = 'ReuseThread'
-        $runspace.Open()
-
-        $ps = [PowerShell]::Create()
-        $ps.Runspace = $runspace
-        [void]$ps.AddScript($scriptBlock)
-        [void]$ps.AddArgument($macList)
-
-        $statusMap = $ps.Invoke()
-
-        if ($ps.HadErrors) {
-            foreach ($e in $ps.Streams.Error) { Write-Verbose "WinRT error: $e" }
-        }
-
-        $ps.Dispose()
-        $runspace.Close()
-        $runspace.Dispose()
-
-        if ($statusMap -and $statusMap -is [hashtable]) {
-            foreach ($d in $Devices) {
-                if ($statusMap.ContainsKey($d.Mac)) {
-                    $d.ConnectionStatus = $statusMap[$d.Mac]
-                }
-            }
-        }
+        Initialize-BluetoothStatusApi
+        $nativeAvailable = $true
     } catch {
-        Write-Verbose "WinRT connection check unavailable: $_"
-        # Fall back to PnP status
+        Write-Verbose "Native Bluetooth status unavailable: $_"
     }
 
+    foreach ($device in $Devices) {
+        $status = 'Unknown'
+        if ($nativeAvailable) {
+            try { $status = Get-NativeBluetoothConnectionStatus -Mac $device.Mac }
+            catch { Write-Verbose "Bluetooth status query failed for $($device.Mac): $_" }
+        }
+        # Classic devices and dual-mode devices use the native connection flag.
+        # For LE devices, also query the explicit PnP connection property.
+        if ($device.HasBLE -or $status -eq 'Unknown') {
+            $pnpStatus = Get-PnPBluetoothConnectionStatus -InstanceIds $device.AllInstanceIds
+            if ($pnpStatus -eq 'Connected' -or $status -eq 'Unknown') { $status = $pnpStatus }
+        }
+        $device.ConnectionStatus = $status
+    }
     return $Devices
 }
 
@@ -554,9 +537,8 @@ function Get-BLERSSI {
 function Set-RegistryValueWithPrivilege {
     <#
     .SYNOPSIS
-    Writes a registry value using .NET RegistryKey API with privilege escalation.
-    Set-ItemProperty fails on protected BT keys even as admin — this takes
-    ownership and grants access before writing.
+    Writes a registry value with minimal access, temporarily granting SetValue
+    when the caller can edit the ACL. Restores the ACL without changing ownership.
     #>
     param(
         [string]$HivePath,      # e.g. "SYSTEM\CurrentControlSet\Services\BTHPORT\..."
@@ -565,67 +547,83 @@ function Set-RegistryValueWithPrivilege {
         [Microsoft.Win32.RegistryValueKind]$Kind
     )
 
-    $wrote = $false
-
-    # Enable backup/restore privileges for the current process
+    $key = $null
     try {
-        $privRule = New-Object System.Security.AccessControl.RegistryAccessRule(
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-            'FullControl',
-            'Allow'
-        )
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            $HivePath, [Microsoft.Win32.RegistryKeyPermissionCheck]::Default,
+            [System.Security.AccessControl.RegistryRights]::SetValue)
+        if (-not $key) { return $false }
+        $key.SetValue($ValueName, $ValueData, $Kind)
+        return $true
+    } catch {
+        Write-Verbose "Direct registry write failed: $_"
+    } finally {
+        if ($key) { $key.Dispose() }
+    }
 
-        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($HivePath, 'ReadWriteSubTree', 'FullControl')
-        if ($key) {
-            $key.SetValue($ValueName, $ValueData, $Kind)
-            $key.Close()
-            $wrote = $true
+    $aclKey = $null
+    $key = $null
+    $originalAcl = $null
+    $aclChanged = $false
+    $restoreError = $null
+    $wrote = $false
+    try {
+        # Retain a handle with ChangePermissions for reliable ACL restoration.
+        $aclKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            $HivePath, [Microsoft.Win32.RegistryKeyPermissionCheck]::Default,
+            ([System.Security.AccessControl.RegistryRights]::ReadPermissions -bor
+             [System.Security.AccessControl.RegistryRights]::ChangePermissions))
+        if ($aclKey) {
+            $section = [System.Security.AccessControl.AccessControlSections]::Access
+            $originalAcl = $aclKey.GetAccessControl($section)
+            $acl = $aclKey.GetAccessControl($section)
+            $privRule = [System.Security.AccessControl.RegistryAccessRule]::new(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+                [System.Security.AccessControl.RegistryRights]::SetValue,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($privRule)
+            $aclKey.SetAccessControl($acl)
+            $aclChanged = $true
+
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                $HivePath, [Microsoft.Win32.RegistryKeyPermissionCheck]::Default,
+                [System.Security.AccessControl.RegistryRights]::SetValue)
+            if ($key) {
+                $key.SetValue($ValueName, $ValueData, $Kind)
+                $wrote = $true
+            }
         }
     } catch {
-        # If direct write fails, try taking ownership first
-        try {
-            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-                $HivePath,
-                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-                [System.Security.AccessControl.RegistryRights]::TakeOwnership
-            )
-            if ($key) {
-                $acl = $key.GetAccessControl()
-                $admin = New-Object System.Security.Principal.NTAccount('BUILTIN', 'Administrators')
-                $acl.SetOwner($admin)
-                $key.SetAccessControl($acl)
-                $key.Close()
+        Write-Verbose "Registry ACL write failed: $_"
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($aclChanged) {
+            # Mark the saved DACL as modified so SetAccessControl writes it back.
+            $originalAcl.SetSecurityDescriptorBinaryForm(
+                $originalAcl.GetSecurityDescriptorBinaryForm(),
+                [System.Security.AccessControl.AccessControlSections]::Access)
+            try { $aclKey.SetAccessControl($originalAcl) }
+            catch { $restoreError = $_ }
+        }
+        if ($aclKey) { $aclKey.Dispose() }
+    }
+    if ($restoreError) {
+        throw "Could not restore registry permissions for '$HivePath': $restoreError"
+    }
 
-                # Re-open with write access after taking ownership
-                $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-                    $HivePath,
-                    [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-                    [System.Security.AccessControl.RegistryRights]::SetValue -bor
-                    [System.Security.AccessControl.RegistryRights]::ReadKey
-                )
-                if ($key) {
-                    $acl = $key.GetAccessControl()
-                    $acl.AddAccessRule($privRule)
-                    $key.SetAccessControl($acl)
-                    $key.SetValue($ValueName, $ValueData, $Kind)
-                    $key.Close()
-                    $wrote = $true
-                }
+    if (-not $wrote) {
+        # Last resort: use reg.exe with the caller's existing permissions.
+        try {
+            $regExe = Join-Path $env:SystemRoot 'System32\reg.exe'
+            if ($Kind -eq [Microsoft.Win32.RegistryValueKind]::Binary) {
+                $hexStr = ($ValueData | ForEach-Object { '{0:x2}' -f $_ }) -join ''
+                $null = & $regExe add "HKLM\$HivePath" /v $ValueName /t REG_BINARY /d $hexStr /f 2>&1
+            } else {
+                $null = & $regExe add "HKLM\$HivePath" /v $ValueName /t REG_SZ /d "$ValueData" /f 2>&1
             }
+            if ($LASTEXITCODE -eq 0) { $wrote = $true }
         } catch {
-            # Last resort: use reg.exe
-            try {
-                $regExe = Join-Path $env:SystemRoot 'System32\reg.exe'
-                if ($Kind -eq [Microsoft.Win32.RegistryValueKind]::Binary) {
-                    $hexStr = ($ValueData | ForEach-Object { '{0:x2}' -f $_ }) -join ''
-                    $null = & $regExe add "HKLM\$HivePath" /v $ValueName /t REG_BINARY /d $hexStr /f 2>&1
-                } else {
-                    $null = & $regExe add "HKLM\$HivePath" /v $ValueName /t REG_SZ /d "$ValueData" /f 2>&1
-                }
-                if ($LASTEXITCODE -eq 0) { $wrote = $true }
-            } catch {
-                Write-Verbose "reg.exe fallback failed: $_"
-            }
+            Write-Verbose "reg.exe fallback failed: $_"
         }
     }
 
@@ -691,14 +689,17 @@ function Restore-BluetoothDeviceName {
     $mac = $Device.Mac.ToLower()
     $bthportKey = "SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\$mac"
 
-    # Clear BTHPORT FriendlyName (single null byte = use device-reported name)
-    Set-RegistryValueWithPrivilege -HivePath $bthportKey -ValueName 'FriendlyName' -ValueData ([byte[]](0)) -Kind ([Microsoft.Win32.RegistryValueKind]::Binary) | Out-Null
-
     # Restore BTHENUM / BTHLE to original name
-    Rename-BluetoothDevice -Device $Device -NewName $originalName | Out-Null
+    $results = @(Rename-BluetoothDevice -Device $Device -NewName $originalName)
 
     # Re-clear BTHPORT so Windows uses the device name
-    Set-RegistryValueWithPrivilege -HivePath $bthportKey -ValueName 'FriendlyName' -ValueData ([byte[]](0)) -Kind ([Microsoft.Win32.RegistryValueKind]::Binary) | Out-Null
+    $cleared = Set-RegistryValueWithPrivilege -HivePath $bthportKey -ValueName 'FriendlyName' -ValueData ([byte[]](0)) -Kind ([Microsoft.Win32.RegistryValueKind]::Binary)
+
+    $failedPnP = @($results | Where-Object { $_ -match '^BTH(?:ENUM|LE) .*: FAILED$' })
+    if (-not $cleared -or $failedPnP.Count -gt 0) {
+        Write-Host '  Restore incomplete. Refresh to see the current name and retry.' -ForegroundColor Red
+        return $false
+    }
 
     return $true
 }
